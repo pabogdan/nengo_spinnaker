@@ -31,7 +31,7 @@ def test_probe_ensemble_voltages():
     ideal = np.dot(ens.bias[:, np.newaxis], c[np.newaxis, None])
 
     # Assert that the ideal curves match the retrieved curves well
-    np.allclose(ideal, sim.data[probe], atol=1e-5)
+    assert np.allclose(ideal, sim.data[probe], atol=1e-5)
 
 
 if __name__ == "__main__":
