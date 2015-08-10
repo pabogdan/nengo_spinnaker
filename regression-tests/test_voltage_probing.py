@@ -18,8 +18,8 @@ def test_probe_ensemble_voltages():
         # Add the voltage probe
         probe = nengo.Probe(ens.neurons, "voltage")
 
-    # Compute the rise time to 90%
-    max_t = -ens.neuron_type.tau_rc * np.log(0.1)
+    # Compute the rise time to 95%
+    max_t = -ens.neuron_type.tau_rc * np.log(0.05)
 
     # Run the simulation for this period of time
     sim = nengo_spinnaker.Simulator(network)
@@ -28,10 +28,10 @@ def test_probe_ensemble_voltages():
 
     # Compute the ideal voltage curves
     c = 1.0 - np.exp(-sim.trange() / ens.neuron_type.tau_rc)
-    ideal = np.dot(ens.bias[:, np.newaxis], c[np.newaxis, None])
+    ideal = np.dot(ens.bias[:, np.newaxis], c[np.newaxis, :]).T
 
     # Assert that the ideal curves match the retrieved curves well
-    assert np.allclose(ideal, sim.data[probe], atol=1e-5)
+    assert np.allclose(ideal, sim.data[probe], atol=1e-3)
 
 
 if __name__ == "__main__":
