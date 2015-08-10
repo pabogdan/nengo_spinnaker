@@ -40,8 +40,8 @@
 /** \brief Configuration flags for Ensemble applications. */
 enum
 {
-  RECORD_SPIKES   = 0x00000001,
-  RECORD_VOLTAGES = 0x00000002,
+  RECORD_SPIKES   = (1 << 0),
+  RECORD_VOLTAGES = (1 << 1),
 } EnsembleFlags;
 
 /* Structs ******************************************************************/
