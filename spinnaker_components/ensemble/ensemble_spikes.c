@@ -17,6 +17,11 @@ enum {
 // Globals
 bool spike_pipeline = false;  // Indicates that spikes are(n't) being processed
 
+bool _spike_transmit_spikes = false;  // Whether spikes should be transmitted
+uint32_t _spike_population_key = 0;   // Base key used to transmit all spikes
+// NOTE: The base key will also include the offset of the first neuron in this
+// core, so to form a key one should add the neuron ID to the base key.
+
 synapse_row_table_t row_table;  // Routing information for spikes
 
 uint32_t *synaptic_rows;      // Start address of weight matrices in memory
@@ -309,11 +314,17 @@ void prepare_synaptic_routing(uint32_t *data, synapse_row_table_t *table)
 /* Prepare for receiving spikes.
  */
 void spikes_prepare_rx(
+  bool transmit_spikes,
+  uint32_t population_key,
   uint32_t *filter_data,
   uint32_t *synaptic_rows_address,
   uint32_t *row_data
 )
 {
+  // Store basic parameters
+  _spike_transmit_spikes = transmit_spikes;
+  _spike_population_key = population_key;
+
   // Prepare queues for receiving spikes
   _spike_queue_prep();
   _row_queue_prep();
