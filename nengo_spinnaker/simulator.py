@@ -83,6 +83,7 @@ class Simulator(object):
         self.dt = self.model.dt
         self._closed = False  # Whether the simulator has been closed or not
         self._running = False
+        self._halt = False
 
         self.host_sim = self._create_host_sim()
 
@@ -339,6 +340,8 @@ class Simulator(object):
         """Clean the SpiNNaker board and prevent further simulation."""
         # Stop the application
         self._closed = True
+        if not self._halt:
+            self.stop()
         self.io_controller.close()
         self.controller.send_signal("stop")
 
