@@ -19,8 +19,9 @@ bool spike_pipeline = false;  // Indicates that spikes are(n't) being processed
 
 synapse_row_table_t row_table;  // Routing information for spikes
 
-uint32_t *synaptic_rows;    // Start address of weight matrices in memory
-uint32_t *synaptic_buffer;  // Buffer for row of weight matrix
+uint32_t *synaptic_rows;      // Start address of weight matrices in memory
+uint32_t next_buffer = 0;     // Index of next synaptic buffer
+uint32_t **synaptic_buffers;  // Buffer for row of weight matrix
 
 if_collection_t *synapse_filters;   // Collection of synaptic filters
 
@@ -219,7 +220,7 @@ void start_spike_pipeline(uint arg0, uint arg1)
 
     // Schedule the DMA
     spin1_dma_transfer(
-      READ_SYNAPTIC_ROW, synaptic_buffer, row_address, DMA_READ,
+      READ_SYNAPTIC_ROW, synaptic_buffers[next_buffer], row_address, DMA_READ,
       (g_ensemble.n_neurons + 1) * sizeof(uint32_t)
     );
   }
@@ -267,6 +268,11 @@ void read_synaptic_row(uint transfer_id, uint tag)
   {
     return;
   }
+
+  // Store the current buffer and update to use the next buffer for the next
+  // transfer.
+  uint32_t *synaptic_buffer = synaptic_buffers[next_buffer];
+  next_buffer ^= 0x1;
 
   // Start the next transfer, ideally that transfer should be hidden behind the
   // following processing.
