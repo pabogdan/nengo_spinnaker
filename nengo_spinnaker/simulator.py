@@ -1,3 +1,4 @@
+import atexit
 import logging
 import nengo
 from nengo.cache import get_default_decoder_cache
@@ -372,8 +373,8 @@ class Simulator(object):
         self.io_controller.close()
         self.controller.send_signal("stop")
 
-            # Remove this simulator from the list of open simulators
-            Simulator._remove_simulator(self)
+        # Remove this simulator from the list of open simulators
+        Simulator._remove_simulator(self)
 
     def trange(self, dt=None):
         return np.arange(1, self.steps + 1) * (self.dt or dt)
