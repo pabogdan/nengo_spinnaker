@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from nengo_spinnaker.builder import builder, ensemble
+from nengo_spinnaker.builder.model import InputPort
 from nengo_spinnaker import operators
 
 
@@ -133,7 +134,7 @@ class TestEnsembleSink(object):
         # Get the sink, check that an appropriate target is return
         sink = ensemble.get_ensemble_sink(model, a_b)
         assert sink.target.obj is b_ens
-        assert sink.target.port is builder.InputPort.standard
+        assert sink.target.port is InputPort.standard
 
     def test_normal_sink_for_passthrough_node(self):
         """Test that sinks for most connections into Ensembles do nothing
@@ -154,7 +155,7 @@ class TestEnsembleSink(object):
         # Get the sink, check that an appropriate target is return
         sink = ensemble.get_ensemble_sink(model, a_b)
         assert sink.target.obj is b_ens
-        assert sink.target.port is builder.InputPort.standard
+        assert sink.target.port is InputPort.standard
 
     def test_normal_sink_for_process_node(self):
         """Test that sinks for most connections into Ensembles do nothing
@@ -175,7 +176,7 @@ class TestEnsembleSink(object):
         # Get the sink, check that an appropriate target is return
         sink = ensemble.get_ensemble_sink(model, a_b)
         assert sink.target.obj is b_ens
-        assert sink.target.port is builder.InputPort.standard
+        assert sink.target.port is InputPort.standard
 
     def test_constant_node_sink_with_slice(self):
         """Test that connections from constant valued Nodes to Ensembles are
@@ -241,47 +242,32 @@ class TestNeuronSinks(object):
         decs = mock.Mock()
         evals = mock.Mock()
         si = mock.Mock()
-        model.params[a_b] = builder.BuiltConnection(decs, evals, a_b.transform,
-                                                    si)
 
         # Get the sink, check that an appropriate target is return
         sink = ensemble.get_neurons_sink(model, a_b)
         assert sink.target.obj is b_ens
         assert sink.target.port is ensemble.EnsembleInputPort.global_inhibition
 
-        assert model.params[a_b].decoders is decs
-        assert model.params[a_b].eval_points is evals
-        assert model.params[a_b].solver_info is si
-        assert np.all(model.params[a_b].transform == np.array([[1.0, 0.5]]))
-        assert model.params[a_b].transform.shape == (1, 2)
-
-    def test_arbitrary_neuron_sink(self):
-        """We have no plan to support arbitrary connections to neurons."""
-        with nengo.Network():
-            a = nengo.Ensemble(100, 2)
-            b = nengo.Ensemble(200, 4)
-
-            a_b = nengo.Connection(a, b.neurons,
-                                   transform=[[1.0, 0.5]]*199 + [[0.5, 1.0]])
-
-        # Create a model with the Ensemble for b in it
-        model = builder.Model()
-        b_ens = operators.EnsembleLIF(b)
-        model.object_operators[b] = b_ens
-
-        # This should fail
-        with pytest.raises(NotImplementedError):
-            ensemble.get_neurons_sink(model, a_b)
-
-    def test_neuron_sink(self):
+    @pytest.mark.parametrize("source", ("neurons", "value"))
+    def test_arbitrary_neuron_sink(self, source):
         """Test that standard connections to neurons return an appropriate
         sink.
+
+        We have no plan to support arbitrary connections to neurons, but we
+        allow them at this stage because they may later become global
+        inhibition connections when we optimise out passthrough Nodes.
         """
         with nengo.Network():
             a = nengo.Ensemble(100, 2)
             b = nengo.Ensemble(100, 4)
 
-            a_b = nengo.Connection(a.neurons, b.neurons, transform=np.eye(100))
+            if source == "neurons":
+                a_b = nengo.Connection(a.neurons, b.neurons,
+                                       transform=np.eye(100))
+            else:
+                a_b = nengo.Connection(a, b.neurons,
+                                       transform=[[1.0, 0.5]]*99 +
+                                                 [[0.5, 1.0]])
 
         # Create a model with the Ensemble for b in it
         model = builder.Model()
@@ -304,7 +290,8 @@ class TestBuildFromEnsembleConnection(object):
         with nengo.Network():
             a = nengo.Ensemble(200, 3)
             b = nengo.Node(lambda t, x: None, size_in=2)
-            a_b = nengo.Connection(a[:2], b, transform=0.5*np.eye(2))
+            a_b = nengo.Connection(a[:2], b, transform=np.array([[0.5, 0],
+                                                                 [0.0, 0.0]]))
 
         # Create the model and built the pre-synaptic Ensemble
         model = builder.Model()
@@ -314,11 +301,42 @@ class TestBuildFromEnsembleConnection(object):
         ensemble.build_ensemble(model, a)
 
         # Now build the connection and check that the params seem sensible
-        params = ensemble.build_from_ensemble_connection(model, a_b)
+        tparams = ensemble.build_from_ensemble_connection(model, a_b)
+        assert tparams.decoders.shape == (2, 200)
+        assert np.all(tparams.decoders[1, :] == 0.0)
+
+        # Check that the params stored in the model are correct
+        params = model.params[a_b]
         assert params.decoders.shape == (200, 2)
-        assert np.all(params.transform == 0.5 * np.eye(2))
+        assert np.all(params.transform == a_b.transform)
         assert np.all(params.eval_points == model.params[a].eval_points)
         assert params.solver_info is not None
+
+    def test_to_global_inhibition(self):
+        """Test that the transmission parameters are modified for a global
+        inhibition connection.
+        """
+        # Create the network
+        with nengo.Network():
+            a = nengo.Ensemble(200, 3)
+            b = nengo.Ensemble(300, 1)
+            a_b = nengo.Connection(a, b.neurons,
+                                   transform=[[1.0, 0.5, 0.2]]*b.n_neurons)
+
+        # Create the model and built the pre-synaptic Ensemble
+        model = builder.Model()
+        model.rng = np.random
+        model.seeds[a] = 1
+        model.seeds[a_b] = 2
+        ensemble.build_ensemble(model, a)
+
+        # Now build the connection and check that the params seem sensible
+        tparams = ensemble.build_from_ensemble_connection(model, a_b)
+        assert tparams.decoders.shape == (1, 200)
+
+        # Check that the params stored in the model are correct
+        params = model.params[a_b]
+        assert np.all(params.transform == a_b.transform)
 
     @pytest.mark.xfail(reason="Unimplemented functionality")
     def test_weights_built(self):
@@ -341,7 +359,10 @@ class TestBuildFromEnsembleConnection(object):
         ensemble.build_ensemble(model, b)
 
         # Now build the connection and check that the params seem sensible
-        params = ensemble.build_from_ensemble_connection(model, a_b)
+        ensemble.build_from_ensemble_connection(model, a_b)
+
+        # Check that the params stored in the model are correct
+        params = model.params[a_b]
         assert params.decoders.shape == (200, 400)
 
 
@@ -385,14 +406,7 @@ class TestProbeEnsemble(object):
         model.build(net)
 
         # Check that a new connection was added and built
-        assert len(model.connections_signals) == 1
-        for conn in model.connections_signals.keys():
-            assert conn.pre_obj is a
-            assert conn.post_obj is p
-            assert conn in model.params  # Was it built?
-
-            if with_slice:
-                assert conn.pre_slice == p.slice
+        assert len(list(model.connection_map.get_signals())) == 1
 
         # Check that a new object was added to the model
         vs = model.object_operators[p]
@@ -449,7 +463,7 @@ class TestProbeNeurons(object):
         # nothing else
         assert model.object_operators[a].local_probes == [p]
         assert len(model.object_operators) == 1
-        assert len(model.connections_signals) == 0
+        assert list(model.connection_map.get_signals()) == []
 
     def test_probe_spike_slice(self):
         with nengo.Network() as net:
@@ -464,7 +478,7 @@ class TestProbeNeurons(object):
         # nothing else
         assert model.object_operators[a].local_probes == [p]
         assert len(model.object_operators) == 1
-        assert len(model.connections_signals) == 0
+        assert list(model.connection_map.get_signals()) == []
 
     def test_probe_voltage(self):
         """Check that probing voltage modifies the local_probes list on the
@@ -482,7 +496,7 @@ class TestProbeNeurons(object):
         # nothing else
         assert model.object_operators[a].local_probes == [p]
         assert len(model.object_operators) == 1
-        assert len(model.connections_signals) == 0
+        assert list(model.connection_map.get_signals()) == []
 
     @pytest.mark.xfail(reason="Unimplemented functionality")
     def test_refractory_time(self):

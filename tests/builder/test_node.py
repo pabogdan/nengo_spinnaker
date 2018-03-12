@@ -6,9 +6,10 @@ import threading
 
 from nengo_spinnaker import add_spinnaker_params
 from nengo_spinnaker.builder import Model
-from nengo_spinnaker.builder.builder import OutputPort, InputPort
+from nengo_spinnaker.builder.model import OutputPort, InputPort
 from nengo_spinnaker.builder.node import (
-    NodeIOController, InputNode, OutputNode
+    NodeIOController, InputNode, OutputNode,
+    build_node_transmission_parameters
 )
 from nengo_spinnaker.operators import ValueSink
 
@@ -67,35 +68,6 @@ class TestNodeIOController(object):
         assert model.object_operators == dict()
         assert model.extra_operators == list()
 
-    def test_build_node_function_of_time_off(self, recwarn):
-        """Test that building a function of time Node is exactly the same as
-        building a regular Node if function of time Nodes are disabled (but
-        that a warning is raised).
-        """
-        with nengo.Network() as net:
-            a = nengo.Node(lambda t: t, size_in=0, size_out=1, label="Stim")
-
-        # Mark the Node as a function of time
-        add_spinnaker_params(net.config)
-        net.config[a].function_of_time = True
-
-        # Create the model
-        model = Model()
-        model.config = net.config
-
-        # Build the Node
-        nioc = NodeIOController(function_of_time_nodes=False)
-        nioc.build_node(model, a)
-
-        # Assert that no new operators were created
-        assert model.object_operators == dict()
-        assert model.extra_operators == list()
-
-        # This should have raised a warning
-        w = recwarn.pop()
-        assert "disabled" in str(w.message)
-        assert "Stim" in str(w.message)
-
     @pytest.mark.parametrize("period", [None, 23.0])
     def test_build_node_function_of_time(self, period):
         """Test that building a function of time Node creates a new operator.
@@ -144,6 +116,27 @@ class TestNodeIOController(object):
         # Assert that this added a new operator to the model
         assert model.object_operators[a].function is a.output
         assert model.object_operators[a].period is model.dt
+
+        assert model.extra_operators == list()
+
+    def test_build_node_process_is_not_constant(self):
+        """Test that building a Node with a process is not treated the same as
+        building a constant valued Node.
+        """
+        with nengo.Network() as net:
+            a = nengo.Node(nengo.processes.Process())
+
+        # Create the model
+        model = Model()
+        model.config = net.config
+
+        # Build the Node
+        nioc = NodeIOController()
+        nioc.build_node(model, a)
+
+        # Assert that this added a new operator to the model
+        assert model.object_operators[a].function is a.output
+        assert model.object_operators[a].period is None
 
         assert model.extra_operators == list()
 
@@ -340,8 +333,6 @@ class TestNodeIOController(object):
 
         # Check the passthrough Node resulted in a new operator
         assert model.object_operators[b].size_in == b.size_in
-        assert model.object_operators[b].transmission_delay == 1
-        assert model.object_operators[b].interpacket_pause == 1
 
         # Get the source and ensure that the appropriate object is returned
         with mock.patch.object(nioc, "get_spinnaker_source_for_node") as gssfn:
@@ -540,6 +531,77 @@ class TestNodeIOController(object):
         # The host network should contain a, b and a_b and nothing else
         assert nioc.host_network.all_nodes == [a, b]
         assert nioc.host_network.all_connections == [a_b]
+
+
+class TestBuildNodeTransmissionParameters(object):
+    def test_build_standard_node(self):
+        # Create a network
+        with nengo.Network():
+            a = nengo.Node(lambda t: [t] * 5, size_out=5)
+            b = nengo.Ensemble(100, 7)
+
+            func = mock.Mock(side_effect=lambda x: x**2)
+            a_b = nengo.Connection(a[0:2], b, function=func,
+                                   transform=np.ones((7, 2)))
+
+        # Create an empty model to build into
+        model = Model()
+
+        # Build the transmission parameters
+        params = build_node_transmission_parameters(model, a_b)
+        assert params.pre_slice == slice(0, 2)
+        assert params.transform.shape == (7, 2)
+        assert params.function is func
+        assert np.all(params.transform == 1.0)
+
+    def test_build_standard_node_global_inhibition(self):
+        # Create a network
+        with nengo.Network():
+            a = nengo.Node(lambda t: [t] * 5, size_out=5)
+            b = nengo.Ensemble(100, 1)
+
+            a_b = nengo.Connection(a[0:2], b.neurons,
+                                   transform=np.ones((b.n_neurons, 2)))
+
+        # Create an empty model to build into
+        model = Model()
+
+        # Build the transmission parameters
+        params = build_node_transmission_parameters(model, a_b)
+        assert params.pre_slice == slice(0, 2)
+        assert params.transform.shape == (1, 2)
+        assert np.all(params.transform == 1.0)
+
+    def test_build_passthrough_node(self):
+        # Create a network
+        with nengo.Network():
+            a = nengo.Node(None, size_in=5)
+            b = nengo.Ensemble(100, 7)
+
+            a_b = nengo.Connection(a[0:2], b, transform=np.ones((7, 2)))
+
+        # Create an empty model to build into
+        model = Model()
+
+        # Build the transmission parameters
+        params = build_node_transmission_parameters(model, a_b)
+        assert params.transform.shape == (7, 5)
+
+    def test_build_passthrough_node_global_inhibition(self):
+        # Create a network
+        with nengo.Network():
+            a = nengo.Node(None, size_in=5)
+            b = nengo.Ensemble(100, 1)
+
+            a_b = nengo.Connection(a[0:2], b.neurons,
+                                   transform=np.ones((b.n_neurons, 2)))
+
+        # Create an empty model to build into
+        model = Model()
+
+        # Build the transmission parameters
+        params = build_node_transmission_parameters(model, a_b)
+        assert params.transform.shape == (1, 5)
 
 
 class TestInputNode(object):

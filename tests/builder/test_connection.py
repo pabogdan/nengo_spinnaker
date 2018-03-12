@@ -2,11 +2,15 @@ import mock
 import nengo
 import numpy as np
 
-from nengo_spinnaker.builder.builder import InputPort, Model, OutputPort
+from nengo_spinnaker.builder.builder import Model
+from nengo_spinnaker.builder.model import InputPort, OutputPort
 from nengo_spinnaker.builder.connection import (
     generic_source_getter,
     generic_sink_getter,
-    build_generic_connection_params
+    build_generic_reception_params,
+    EnsembleTransmissionParameters,
+    PassthroughNodeTransmissionParameters,
+    NodeTransmissionParameters
 )
 
 
@@ -56,16 +60,67 @@ def test_generic_sink_getter():
     assert spec.target.port is InputPort.standard
 
 
-def test_build_standard_connection_params():
+def test_build_standard_reception_params():
     # Create the test network
     with nengo.Network():
         a = nengo.Node(lambda t: [t, t], size_in=0, size_out=2)
         b = nengo.Node(lambda t, x: None, size_in=1, size_out=0)
-        a_b = nengo.Connection(a[0], b)
+        a_b = nengo.Connection(a[0], b, synapse=0.03)
 
-    # Build the connection parameters
-    params = build_generic_connection_params(None, a_b)
-    assert params.decoders is None
-    assert params.transform == 1.0
-    assert params.eval_points is None
-    assert params.solver_info is None
+    # Build the transmission parameters
+    params = build_generic_reception_params(None, a_b)
+    assert params.filter is a_b.synapse
+
+
+class TestEnsembleTransmissionParameters(object):
+    def test_eq_ne(self):
+        """Create a series of EnsembleTransmissionParameters and ensure that
+        they only report equal when they are.
+        """
+        class MyETP(EnsembleTransmissionParameters):
+            pass
+
+        tp1 = EnsembleTransmissionParameters(np.ones((3, 3)), np.eye(3))
+        tp2 = EnsembleTransmissionParameters(np.ones((1, 1)), np.eye(1))
+        tp3 = EnsembleTransmissionParameters(np.eye(3), np.eye(3))
+        tp4 = MyETP(np.ones((3, 3)), np.eye(3))
+
+        assert tp1 != tp2
+        assert tp1 != tp3
+        assert tp1 != tp4
+
+        tp5 = EnsembleTransmissionParameters(np.ones((3, 3)), np.eye(3))
+        assert tp1 == tp5
+
+        tp6 = EnsembleTransmissionParameters(np.ones((3, 1)), np.ones((3, 1)))
+        assert tp1 == tp6
+
+
+class TestNodeTransmissionParameters(object):
+    def test_eq_ne(self):
+        class MyNTP(NodeTransmissionParameters):
+            pass
+
+        # NodeTransmissionParameters are only equivalent if they are of the
+        # same type, they share the same pre_slice and transform.
+        pars = [
+            (NodeTransmissionParameters, (slice(0, 5), None, np.ones((5, 5)))),
+            (NodeTransmissionParameters, (slice(None), None, np.ones((5, 5)))),
+            (NodeTransmissionParameters, (slice(0, 5), None, np.eye(5))),
+            (NodeTransmissionParameters, (slice(0, 5), None, np.ones((1, 1)))),
+            (NodeTransmissionParameters,
+             (slice(0, 5), lambda x: x, np.ones((5, 5)))),
+            (MyNTP, (slice(0, 5), None, np.ones((5, 5)))),
+        ]
+        ntps = [cls(*args) for cls, args in pars]
+
+        # Check the inequivalence works
+        for a in ntps:
+            for b in ntps:
+                if a is not b:
+                    assert a != b
+
+        # Check that equivalence works
+        for a, b in zip(ntps, [cls(*args) for cls, args in pars]):
+            assert a is not b
+            assert a == b

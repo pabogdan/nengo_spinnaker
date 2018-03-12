@@ -8,7 +8,9 @@ from nengo.utils.builder import full_transform
 from nengo.utils import numpy as npext
 import numpy as np
 
-from .builder import BuiltConnection, InputPort, Model, ObjectPort, spec
+from .builder import BuiltConnection, Model, ObjectPort, spec
+from .connection import EnsembleTransmissionParameters
+from .model import InputPort
 from .ports import EnsembleInputPort
 from .. import operators
 from ..utils import collections as collections_ext
@@ -57,29 +59,19 @@ def get_neurons_sink(model, connection):
     """Get the sink for connections into the neurons of an ensemble."""
     ens = model.object_operators[connection.post_obj.ensemble]
 
-    if isinstance(connection.pre_obj, nengo.ensemble.Neurons):
-        # Connections from Neurons can go straight to the Neurons
-        return spec(ObjectPort(ens, EnsembleInputPort.neurons))
-    elif np.all(connection.transform[1:] == connection.transform[0]):
+    if (connection.transform.ndim == 2 and
+            np.all(connection.transform[1:] == connection.transform[0])):
         # Connections from non-neurons to Neurons where the transform delivers
         # the same value to all neurons are treated as global inhibition
         # connection.
-        # Modify the connection parameters
-        model.params[connection] = BuiltConnection(
-            model.params[connection].decoders,
-            model.params[connection].eval_points,
-            model.params[connection].transform[0, np.newaxis],
-            model.params[connection].solver_info
-        )
-
         # Return a signal to the correct port.
         return spec(ObjectPort(ens, EnsembleInputPort.global_inhibition))
     else:
-        # We don't support arbitrary connections into neurons
-        raise NotImplementedError(
-            "SpiNNaker does not support arbitrary connections into Neurons. "
-            "If this is a serious hindrance please open an issue on GitHub."
-        )
+        #  - Connections from Neurons can go straight to the Neurons.
+        #  - Otherwise we don't support arbitrary connections into neurons, but
+        #    we allow them because they may be optimised out later when we come
+        #    to remove passthrough nodes.
+        return spec(ObjectPort(ens, EnsembleInputPort.neurons))
 
 
 ensemble_builders = collections_ext.registerabledict()
@@ -144,39 +136,40 @@ def build_lif(model, ens):
     model.object_operators[ens] = operators.EnsembleLIF(ens)
 
 
-@Model.connection_parameter_builders.register(nengo.Ensemble)
+@Model.transmission_parameter_builders.register(nengo.Ensemble)
 def build_from_ensemble_connection(model, conn):
     """Build the parameters object for a connection from an Ensemble."""
-    # Create a random number generator
-    rng = np.random.RandomState(model.seeds[conn])
-
-    # Get the transform
-    transform = full_transform(conn, slice_pre=False)
-
-    # Use Nengo upstream to build parameters for the solver
-    eval_points, activities, targets = connection_b.build_linear_system(
-        model, conn, rng
-    )
-
-    # Use cached solver
-    solver = model.decoder_cache.wrap_solver(conn.solver)
     if conn.solver.weights:
         raise NotImplementedError(
             "SpiNNaker does not currently support neuron to neuron connections"
         )
-    else:
-        decoders, solver_info = solver(activities, targets, rng=rng)
 
-    # Return the parameters
-    return BuiltConnection(
-        decoders=decoders,
-        eval_points=eval_points,
-        transform=transform,
-        solver_info=solver_info
+    # Create a random number generator
+    rng = np.random.RandomState(model.seeds[conn])
+
+    # Get the transform
+    transform = full_transform(conn, slice_pre=False, allow_scalars=False)
+
+    # Solve for the decoders
+    eval_points, decoders, solver_info = connection_b.build_decoders(
+        model, conn, rng
     )
 
+    # Store the parameters in the model
+    model.params[conn] = BuiltConnection(decoders=decoders,
+                                         eval_points=eval_points,
+                                         transform=transform,
+                                         solver_info=solver_info)
 
-@Model.connection_parameter_builders.register(nengo.ensemble.Neurons)
+    # Modify the transform if this is a global inhibition connection
+    if (isinstance(conn.post_obj, nengo.ensemble.Neurons) and
+            np.all(transform[0, :] == transform[1:, :])):
+        transform = np.array([transform[0]])
+
+    return EnsembleTransmissionParameters(decoders, transform)
+
+
+@Model.transmission_parameter_builders.register(nengo.ensemble.Neurons)
 def build_from_neurons_connection(model, conn):
     """Build the parameters object for a connection from Neurons."""
     raise NotImplementedError(

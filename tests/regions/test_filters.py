@@ -1,144 +1,123 @@
-import math
 import mock
 import nengo
+from nengo.utils.filter_design import cont2discrete
+import numpy as np
 import pytest
 import struct
 import tempfile
 
+from nengo_spinnaker.builder.model import (
+    SignalParameters, ReceptionParameters, ReceptionSpec)
 from nengo_spinnaker.regions.filters import (
     FilterRegion, FilterRoutingRegion, LowpassFilter, NoneFilter,
-    make_filter_regions)
+    LinearFilter, make_filter_regions, Filter)
 from nengo_spinnaker.utils.keyspaces import KeyspaceContainer
 from nengo_spinnaker.utils import type_casts as tp
 
 
+@pytest.mark.parametrize("width, latching, init_index, words",
+                         [(10, False, 0xDEAD, 3),
+                          (11, True, 0xCAFE, 5)])
+def test_filter_pack_into(width, latching, init_index, words):
+    class MyFilter(Filter):
+        def size_words(self):
+            return words
+
+        def method_index(self):
+            return init_index
+
+    # Create a filter instance, assert that it packs data correctly
+    fil = MyFilter(width, latching)
+    fil.pack_data = mock.Mock()
+
+    # Create a buffer to pack into
+    data = bytearray(100)
+    fil.pack_into(0.001, data, 5)
+
+    # Assert we were called correctly
+    fil.pack_data.assert_called_once_with(0.001, data, 21)
+
+    # Unpack, check that the values were fine
+    (n_words, init_method, size, flags) = struct.unpack_from("<4I", data, 5)
+    assert n_words == words
+    assert init_method == init_index
+    assert flags == (0x1 if latching else 0x0)
+    assert size == width
+
+
 class TestNoneFilter(object):
     """Test creating and writing out None filters."""
-    @pytest.mark.parametrize("width, latching", [(5, True), (10, False)])
-    def test_standard(self, width, latching):
-        nf = NoneFilter(width, latching)
+    def test_size_words(self):
+        f = NoneFilter(1, False)
+        assert f.size_words() == 0
 
-        # Pack the filter into some data
-        data = bytearray(nf.size)
-        nf.pack_into(0.001, data)
+    def test_pack_data(self):
+        f = NoneFilter(1, False)
 
-        # Check the values are sane
-        v1, v2, mask, size = struct.unpack("<4I", data)
-        assert v1 == 0
-        assert v2 == tp.value_to_fix(1.0)
-        assert mask == (0xffffffff if latching else 0x00000000)
-        assert size == width
+        # Packing into an empty array should be fine because there is nothing
+        # to pack
+        data = bytearray(0)
+        f.pack_data(0.001, data)
 
     @pytest.mark.parametrize("width, latching", [(5, True), (10, False)])
-    def test_from_signal_and_connection(self, latching, width):
+    def test_from_parameters(self, latching, width):
         # Create the mock signal and connection
-        signal = mock.Mock(name="signal", spec_set=["latching"])
-        signal.latching = latching
-
-        with nengo.Network():
-            a = nengo.Ensemble(100, width)
-            b = nengo.Ensemble(100, width)
-            connection = nengo.Connection(a, b, synapse=None)
+        signal = SignalParameters(latching=latching)
+        rps = ReceptionParameters(None, width)
 
         # Build the filter
-        nf = NoneFilter.from_signal_and_connection(signal, connection)
+        nf = NoneFilter.from_parameters(signal, rps)
         assert NoneFilter(width, latching) == nf
 
-    @pytest.mark.parametrize("latching", [True, False])
-    def test_from_signal_and_connection_to_slice(self, latching):
-        # Create the mock signal and connection
-        signal = mock.Mock(name="signal", spec_set=["latching"])
-        signal.latching = latching
-
-        with nengo.Network():
-            a = nengo.Ensemble(100, 2)
-            b = nengo.Ensemble(100, 2)
-            connection = nengo.Connection(a[1], b[0], synapse=None)
-
-        # Build the filter
-        nf = NoneFilter.from_signal_and_connection(signal, connection)
-        assert NoneFilter(2, latching) == nf
-
     @pytest.mark.parametrize("width, latching", [(5, True)])
-    def test_from_signal_and_connection_force_width(self, latching, width):
+    def test_from_parameters_force_width(self, latching, width):
         # Create the mock signal and connection
-        signal = mock.Mock(name="signal", spec_set=["latching"])
-        signal.latching = latching
-
-        with nengo.Network():
-            a = nengo.Ensemble(100, width)
-            b = nengo.Ensemble(100, width)
-            connection = nengo.Connection(a, b, synapse=None)
+        signal = SignalParameters(latching=latching)
+        rps = ReceptionParameters(None, width)
 
         # Build the filter
-        nf = NoneFilter.from_signal_and_connection(signal, connection, width=1)
+        nf = NoneFilter.from_parameters(signal, rps, width=1)
         assert NoneFilter(1, latching) == nf
 
 
 class TestLowpassFilter(object):
-    @pytest.mark.parametrize("width, latching, dt, tc",
-                             [(3, False, 0.001, 0.01), (1, True, 0.002, 0.2)])
-    def test_standard(self, width, latching, dt, tc):
-        """Test creating and writing out lowpass filters."""
-        lpf = LowpassFilter(width, latching, tc)
+    @pytest.mark.parametrize("tau, dt", [(0.01, 0.001), (0.03, 0.002)])
+    def test_pack_data(self, tau, dt):
+        # Create the filter
+        f = LowpassFilter(0, False, tau)
 
-        # Pack the filter into some data
-        data = bytearray(lpf.size)
-        lpf.pack_into(dt, data)
+        # Pack into an array
+        data = bytearray(8)
+        f.pack_data(dt, data, 0)
 
-        # Check the values are sane
-        v1, v2, mask, size = struct.unpack("<4I", data)
-        val = math.exp(-dt / tc)
-        assert v1 == tp.value_to_fix(val)
-        assert v2 == tp.value_to_fix(1 - val)
-        assert mask == (0xffffffff if latching else 0x00000000)
-        assert size == width
+        # Compute expected values
+        exp_a = tp.value_to_fix(np.exp(-dt / tau))
+        exp_b = tp.value_to_fix(1.0 - np.exp(-dt / tau))
+
+        # Unpack and check for accuracy
+        (a, b) = struct.unpack_from("<2I", data)
+        assert a == exp_a
+        assert b == exp_b
 
     @pytest.mark.parametrize("width, latching, tc",
                              [(3, False, 0.01), (1, True, 0.2)])
-    def test_from_signal_and_connection(self, width, latching, tc):
+    def test_from_parameters(self, width, latching, tc):
         # Create the mock signal and connection
-        signal = mock.Mock(name="signal", spec_set=["latching"])
-        signal.latching = latching
-
-        with nengo.Network():
-            a = nengo.Ensemble(100, width)
-            b = nengo.Ensemble(100, width)
-            connection = nengo.Connection(a, b, synapse=nengo.Lowpass(tc))
+        signal = SignalParameters(latching=latching)
+        rps = ReceptionParameters(nengo.Lowpass(tc), width)
 
         # Create the filter
-        lpf = LowpassFilter.from_signal_and_connection(signal, connection)
+        lpf = LowpassFilter.from_parameters(signal, rps)
         assert lpf == LowpassFilter(width, latching, tc)
 
     @pytest.mark.parametrize("width, latching, tc", [(3, False, 0.01)])
-    def test_from_signal_and_connection_force_width(self, width, latching, tc):
+    def test_from_parameters_force_width(self, width, latching, tc):
         # Create the mock signal and connection
-        signal = mock.Mock(name="signal", spec_set=["latching"])
-        signal.latching = latching
-
-        with nengo.Network():
-            a = nengo.Ensemble(100, width)
-            b = nengo.Ensemble(100, width)
-            connection = nengo.Connection(a, b, synapse=nengo.Lowpass(tc))
+        signal = SignalParameters(latching=latching)
+        rps = ReceptionParameters(nengo.Lowpass(tc), width)
 
         # Create the filter
-        lpf = LowpassFilter.from_signal_and_connection(signal, connection,
-                                                       width=2)
-        assert lpf == LowpassFilter(2, latching, tc)
-
-    @pytest.mark.parametrize("latching, tc", [(False, 0.01), (True, 0.2)])
-    def test_from_signal_and_connection_with_slice(self, latching, tc):
-        # Create the mock signal and connection
-        signal = mock.Mock(name="signal", spec_set=["latching"])
-        signal.latching = latching
-
-        with nengo.Network():
-            a = nengo.Ensemble(100, 1)
-            b = nengo.Ensemble(100, 2)
-            connection = nengo.Connection(a, b[1], synapse=nengo.Lowpass(tc))
-
-        # Create the filter
-        lpf = LowpassFilter.from_signal_and_connection(signal, connection)
+        lpf = LowpassFilter.from_parameters(signal, rps, width=2)
         assert lpf == LowpassFilter(2, latching, tc)
 
     def test_eq(self):
@@ -157,6 +136,74 @@ class TestLowpassFilter(object):
         assert lpf != nf and nf != lpf
 
 
+class TestLinearFilter(object):
+    @pytest.mark.parametrize(
+        "num, den, dt, order",
+        [([1.0], [0.3, 1.0], 0.001, 1),
+         ([1.0], [0.03, 0.4, 1.0], 0.01, 2),
+         ]
+    )
+    def test_pack_data(self, num, den, dt, order):
+        # Create the filter
+        lf = LinearFilter(0, False, num, den)
+
+        # Create a buffer to pack data into
+        data = bytearray((order*2 + 1)*4)
+
+        # Pack the parameters
+        lf.pack_data(dt, data, 0)
+
+        # Generate what we expect the data to look like
+        numd, dend, _ = cont2discrete((num, den), dt)
+        numd = numd.flatten()
+        exp = list()
+        for a, b in zip(dend[1:], numd[1:]):
+            exp.append(-a)
+            exp.append(b)
+        expected_data = tp.np_to_fix(np.array(exp)).tostring()
+
+        # Check that's what we get
+        assert struct.unpack_from("<I", data, 0)[0] == order
+        assert data[4:] == expected_data
+
+    def test_from_parameters_force_width(self):
+        # Create the mock signal and connection
+        signal = SignalParameters(latching=True)
+        rps = ReceptionParameters(nengo.LinearFilter([1.0], [0.5, 1.0]), 1)
+
+        # Create the filter
+        lpf = LinearFilter.from_parameters(signal, rps, width=2)
+        assert lpf == LinearFilter(2, True, [1.0], [0.5, 1.0])
+
+    def test_method_index(self):
+        lf = LinearFilter(0, False, [1.0], [1.0, 0.5])
+        assert lf.method_index() == 2
+
+    @pytest.mark.parametrize(
+        "num, den, size_words",
+        [([1.0], [1.0], 1),
+         ([1.0], [0.1, 1.0], 3),
+         ([1.0], [0.1, 0.1, 1.0], 5),
+         ]
+    )
+    def test_size_words(self, num, den, size_words):
+        lf = LinearFilter(0, False, num, den)
+        assert lf.size_words() == size_words
+
+    def test_eq(self):
+        # Check that linear filters are equal iff. they share a numerator and
+        # denominator.
+        lpf = LowpassFilter(0, False, 0.1)
+        lf1 = LinearFilter(0, False, [1.0], [0.1, 0.2])
+        lf2 = LinearFilter(0, False, [1.0], [0.1, 0.3])
+        lf3 = LinearFilter(0, False, [1.0], [0.1, 0.2])
+
+        assert lf1 != lpf
+        assert lf2 != lf1
+        assert lf3 != lf2
+        assert lf3 == lf1
+
+
 def test_filter_region():
     """Test creation of a filter data region."""
     # Create two filters
@@ -166,8 +213,9 @@ def test_filter_region():
     # Create the filter region
     fr = FilterRegion(fs, dt=0.001)
 
-    # The size should be correct
-    assert fr.sizeof() == 4 + 16 * len(fs)
+    # The size should be correct (count of words + header 1 + data 1 + header 2
+    # + data 2)
+    assert fr.sizeof() == 4 + 16 + 8 + 16 + 0
 
     # Check that the data is written out correctly
     fp = tempfile.TemporaryFile()
@@ -177,9 +225,9 @@ def test_filter_region():
     length, = struct.unpack("<I", fp.read(4))
     assert length == len(fs)
 
-    expected_data = bytearray(32)
+    expected_data = bytearray(fr.sizeof() - 4)
     fs[0].pack_into(fr.dt, expected_data)
-    fs[1].pack_into(fr.dt, expected_data, 16)
+    fs[1].pack_into(fr.dt, expected_data, (fs[0].size_words() + 4)*4)
     assert fp.read() == expected_data
 
 
@@ -187,8 +235,8 @@ def test_filter_routing_region():
     """Test creation of a filter routing region."""
     # Define some keyspaces
     ksc = KeyspaceContainer()
-    ks_a = ksc["nengo"](object=0, connection=3)
-    ks_b = ksc["nengo"](object=127, connection=255, cluster=63, index=15)
+    ks_a = ksc["nengo"](connection_id=3)
+    ks_b = ksc["nengo"](connection_id=255, cluster=63, index=15)
     ksc.assign_fields()
 
     # Define the filter routes, these map a keyspace to an integer
@@ -217,7 +265,7 @@ def test_filter_routing_region():
     valid_d_mask = ksc["nengo"].get_mask(field="index")
 
     for _ in range(len(ks_routes)):
-        key, mask, i, d_mask = struct.unpack("<4I", fp.read(16))
+        key, mask, d_mask, i = struct.unpack("<4I", fp.read(16))
         assert mask == valid_mask, hex(mask) + " != " + hex(valid_mask)
         assert d_mask == valid_d_mask
 
@@ -234,34 +282,26 @@ class TestMakeFilterRegions(object):
     @pytest.mark.parametrize("minimise", [True, False])
     def test_equivalent_filters(self, minimise):
         """Test construction of filter regions from signals and keyspaces."""
-        # Create two keyspaces, two signals and two connections with equivalent
-        # synapses.
+        # Create two keyspaces, two signal parameters and two reception
+        # parameters with equivalent synapses.
         ks_a = mock.Mock(name="Keyspace[A]")
-        signal_a = mock.Mock(name="Signal[A]")
-        signal_a.keyspace, signal_a.latching = ks_a, False
+        signal_a = SignalParameters(keyspace=ks_a, latching=False)
 
         ks_b = mock.Mock(name="Keyspace[B]")
-        signal_b = mock.Mock(name="Signal[B]")
-        signal_b.keyspace, signal_b.latching = ks_b, False
+        signal_b = SignalParameters(keyspace=ks_b, latching=False)
 
-        conn_a = mock.Mock(name="Connection[A]")
-        conn_a.post_obj.size_in = 3
-        conn_a.synapse = nengo.Lowpass(0.01)
+        rp_a = ReceptionParameters(nengo.Lowpass(0.01), 3)
+        rp_b = ReceptionParameters(nengo.Lowpass(0.01), 3)
 
-        conn_b = mock.Mock(name="Connection[B]")
-        conn_b.post_obj.size_in = 3
-        conn_b.synapse = nengo.Lowpass(0.01)
-
-        # Create the type of dictionary that is expected as input
-        signals_connections = {
-            signal_a: [conn_a],
-            signal_b: [conn_b],
-        }
+        # Create the data structure that is expected as input
+        specs = [
+            ReceptionSpec(signal_a, rp_a),
+            ReceptionSpec(signal_b, rp_b),
+        ]
 
         # Create the regions, with minimisation
         filter_region, routing_region = make_filter_regions(
-            signals_connections, 0.001,
-            minimise=minimise,
+            specs, 0.001, minimise=minimise,
             filter_routing_tag="spam",
             index_field="eggs"
         )
@@ -291,33 +331,26 @@ class TestMakeFilterRegions(object):
 
     def test_different_filters(self):
         """Test construction of filter regions from signals and keyspaces."""
-        # Create two keyspaces, two signals and two connections with equivalent
-        # synapses.
+        # Create two keyspaces, two signals and two reception parameters with
+        # different synapses.
         ks_a = mock.Mock(name="Keyspace[A]")
-        signal_a = mock.Mock(name="Signal[A]")
-        signal_a.keyspace, signal_a.latching = ks_a, False
+        signal_a = SignalParameters(keyspace=ks_a, latching=False)
 
         ks_b = mock.Mock(name="Keyspace[B]")
-        signal_b = mock.Mock(name="Signal[B]")
-        signal_b.keyspace, signal_b.latching = ks_b, False
+        signal_b = SignalParameters(keyspace=ks_b, latching=False)
 
-        conn_a = mock.Mock(name="Connection[A]")
-        conn_a.post_obj.size_in = 3
-        conn_a.synapse = nengo.Lowpass(0.01)
-
-        conn_b = mock.Mock(name="Connection[B]")
-        conn_b.post_obj.size_in = 3
-        conn_b.synapse = None
+        rp_a = ReceptionParameters(nengo.Lowpass(0.01), 3)
+        rp_b = ReceptionParameters(None, 3)
 
         # Create the type of dictionary that is expected as input
-        signals_connections = {
-            signal_a: [conn_a],
-            signal_b: [conn_b],
-        }
+        specs = [
+            ReceptionSpec(signal_a, rp_a),
+            ReceptionSpec(signal_b, rp_b),
+        ]
 
         # Create the regions, with minimisation
         filter_region, routing_region = make_filter_regions(
-            signals_connections, 0.001,
+            specs, 0.001,
             minimise=True,  # Shouldn't achieve anything
             filter_routing_tag="spam",
             index_field="eggs"
@@ -344,32 +377,26 @@ class TestMakeFilterRegions(object):
         """Test construction of filter regions from signals and keyspaces."""
         # Create two keyspaces, two signals and two connections with equivalent
         # synapses.
+        # Create two keyspaces, two signals and two reception parameters with
+        # different synapses.
         ks_a = mock.Mock(name="Keyspace[A]")
-        signal_a = mock.Mock(name="Signal[A]")
-        signal_a.keyspace, signal_a.latching = ks_a, False
+        signal_a = SignalParameters(keyspace=ks_a, latching=False)
 
         ks_b = mock.Mock(name="Keyspace[B]")
-        signal_b = mock.Mock(name="Signal[B]")
-        signal_b.keyspace, signal_b.latching = ks_b, False
+        signal_b = SignalParameters(keyspace=ks_b, latching=False)
 
-        conn_a = mock.Mock(name="Connection[A]")
-        conn_a.post_obj.size_in = 3
-        conn_a.synapse = nengo.Lowpass(0.01)
-
-        conn_b = mock.Mock(name="Connection[B]")
-        conn_b.post_obj.size_in = 5
-        conn_b.synapse = None
+        rp_a = ReceptionParameters(nengo.Lowpass(0.01), 3)
+        rp_b = ReceptionParameters(None, 5)
 
         # Create the type of dictionary that is expected as input
-        signals_connections = {
-            signal_a: [conn_a],
-            signal_b: [conn_b],
-        }
+        specs = [
+            ReceptionSpec(signal_a, rp_a),
+            ReceptionSpec(signal_b, rp_b),
+        ]
 
         # Create the regions, with minimisation
-        filter_region, routing_region = make_filter_regions(
-            signals_connections, 0.001, width=1
-        )
+        filter_region, routing_region = make_filter_regions(specs, 0.001,
+                                                            width=1)
 
         # Check that the filter region is as expected
         for f in filter_region.filters:

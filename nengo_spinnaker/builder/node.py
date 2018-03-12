@@ -1,10 +1,13 @@
 import nengo
+from nengo.processes import Process
+from nengo.utils.builder import full_transform
 import numpy as np
 import threading
-import warnings
 
-from nengo_spinnaker.builder.builder import (
-    InputPort, ObjectPort, OutputPort, spec)
+from .connection import (PassthroughNodeTransmissionParameters,
+                         NodeTransmissionParameters)
+from nengo_spinnaker.builder.builder import ObjectPort, spec, Model
+from nengo_spinnaker.builder.model import InputPort, OutputPort
 from nengo_spinnaker.operators import Filter, ValueSink, ValueSource
 from nengo_spinnaker.utils.config import getconfig
 
@@ -52,27 +55,26 @@ class NodeIOController(object):
     thread which manages IO.  This thread must have a `stop` method which
     causes the thread to stop executing. See the Ethernet implementation for an
     example.
+
+    Attributes
+    ----------
+    host_network : :py:class:`~nengo.Network`
+        Network containing everything required to perform the host-side of the
+        simulation.
+    passthrough_nodes : {Node: operator, ...}
+        Map of passthrough Nodes to the operators which simulate them on
+        SpiNNaker, this is exposed so that some passthrough Nodes may be
+        optimised out.
     """
 
-    def __init__(self, function_of_time_nodes=True):
-        """Create a new Node IO controller and builder.
-
-        Parameters
-        ----------
-        function_of_time_nodes : bool
-            Whether function of time nodes are enabled (True, the default) or
-            not.
-        """
+    def __init__(self):
         # Create a network which will contain everything that is to be
         # simulated on the host computer.
         self.host_network = nengo.Network()
 
-        # Other parameters
-        self.allow_f_of_t_nodes = function_of_time_nodes
-
         # Store objects that we've added
         self._f_of_t_nodes = dict()
-        self._passthrough_nodes = dict()
+        self.passthrough_nodes = dict()
         self._added_nodes = set()
         self._added_conns = set()
         self._input_nodes = dict()
@@ -114,28 +116,30 @@ class NodeIOController(object):
 
         if node.output is None:
             # If the Node is a passthrough Node then create a new filter object
-            # for it.
-            op = Filter(node.size_in)
-            self._passthrough_nodes[node] = op
+            # for it.  We might be requested to use a fixed number of cores or
+            # chips, we extract that information from the config.
+            n_cores = getconfig(model.config, node, "n_cores_per_chip")
+            n_chips = getconfig(model.config, node, "n_chips")
+
+            op = Filter(node.size_in, n_cores_per_chip=n_cores,
+                        n_chips=n_chips)
+            self.passthrough_nodes[node] = op
             model.object_operators[node] = op
-        elif f_of_t and self.allow_f_of_t_nodes:
+        elif f_of_t:
             # If the Node is a function of time then add a new value source for
             # it.  Determine the period by looking in the config, if the output
             # is a constant then the period is dt (i.e., it repeats every
             # timestep).
-            if not callable(node.output):
-                period = model.dt
-            else:
+            if callable(node.output) or isinstance(node.output, Process):
                 period = getconfig(model.config, node,
                                    "function_of_time_period")
+            else:
+                period = model.dt
 
             vs = ValueSource(node.output, node.size_out, period)
             self._f_of_t_nodes[node] = vs
             model.object_operators[node] = vs
         else:
-            if f_of_t:
-                warnings.warn("{} will not be precomputed as function of time "
-                              "Nodes are currently disabled.".format(node))
             with self.host_network:
                 self._add_node(node)
 
@@ -153,10 +157,10 @@ class NodeIOController(object):
 
     def get_node_source(self, model, cn):
         """Get the source for a connection originating from a Node."""
-        if cn.pre_obj in self._passthrough_nodes:
+        if cn.pre_obj in self.passthrough_nodes:
             # If the Node is a passthrough Node then we return a reference
             # to the Filter operator we created earlier regardless.
-            return spec(ObjectPort(self._passthrough_nodes[cn.pre_obj],
+            return spec(ObjectPort(self.passthrough_nodes[cn.pre_obj],
                                    OutputPort.standard))
         elif cn.pre_obj in self._f_of_t_nodes:
             # If the Node is a function of time Node then we return a
@@ -164,7 +168,7 @@ class NodeIOController(object):
             return spec(ObjectPort(self._f_of_t_nodes[cn.pre_obj],
                                    OutputPort.standard))
         elif (type(cn.post_obj) is nengo.Node and
-                cn.post_obj not in self._passthrough_nodes):
+                cn.post_obj not in self.passthrough_nodes):
             # If this connection goes from a Node to another Node (exactly, not
             # any subclasses) then we just add both nodes and the connection to
             # the host model.
@@ -205,13 +209,13 @@ class NodeIOController(object):
 
     def get_node_sink(self, model, cn):
         """Get the sink for a connection terminating at a Node."""
-        if cn.post_obj in self._passthrough_nodes:
+        if cn.post_obj in self.passthrough_nodes:
             # If the Node is a passthrough Node then we return a reference
             # to the Filter operator we created earlier regardless.
-            return spec(ObjectPort(self._passthrough_nodes[cn.post_obj],
+            return spec(ObjectPort(self.passthrough_nodes[cn.post_obj],
                                    InputPort.standard))
         elif (type(cn.pre_obj) is nengo.Node and
-                cn.pre_obj not in self._passthrough_nodes):
+                cn.pre_obj not in self.passthrough_nodes):
             # If this connection goes from a Node to another Node (exactly, not
             # any subclasses) then we just add both nodes and the connection to
             # the host model.
@@ -278,6 +282,33 @@ class NodeIOController(object):
     def close(self):
         """Close the NodeIOController."""
         pass
+
+
+@Model.transmission_parameter_builders.register(nengo.Node)
+def build_node_transmission_parameters(model, conn):
+    """Build transmission parameters for a connection originating at a Node."""
+    if conn.pre_obj.output is not None:
+        # Connection is not from a passthrough Node
+        # Get the full transform, not including the pre_slice
+        transform = full_transform(conn, slice_pre=False, allow_scalars=False)
+    else:
+        # Connection is from a passthrough Node
+        # Get the full transform
+        transform = full_transform(conn, allow_scalars=False)
+
+    # If the connection is to neurons and the transform is equivalent in every
+    # row we treat it as a global inhibition connection and shrink it down to
+    # one row.
+    if (isinstance(conn.post_obj, nengo.ensemble.Neurons) and
+            np.all(transform[0, :] == transform[1:, :])):
+        # Reduce the size of the transform
+        transform = np.array([transform[0]])
+
+    if conn.pre_obj.output is not None:
+        return NodeTransmissionParameters(conn.pre_slice, conn.function,
+                                          transform)
+    else:
+        return PassthroughNodeTransmissionParameters(transform)
 
 
 class InputNode(nengo.Node):

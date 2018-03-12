@@ -4,41 +4,111 @@ import pytest
 import struct
 import tempfile
 
+from nengo_spinnaker.builder.model import SignalParameters
 from nengo_spinnaker.operators.filter import (SystemRegion,
-                                              get_transforms_and_keys)
+                                              get_transforms_and_keys,
+                                              ParallelFilterSlice)
+from nengo_spinnaker.builder.ensemble import EnsembleTransmissionParameters
+from nengo_spinnaker.builder.node import PassthroughNodeTransmissionParameters
+
+
+class TestParallelFilterSlice(object):
+    def test_accepts_signal(self):
+        # Create a series of vertex slices
+        pfss = [
+            ParallelFilterSlice(slice(0, 16), slice(None)),
+            ParallelFilterSlice(slice(8, 24), slice(None)),
+            ParallelFilterSlice(slice(16, 32), slice(None)),
+        ]
+
+        # Create a series of transmission parameters, of current known types.
+        ens_0_to_8 = np.random.uniform(size=(100, 10))
+        ens_0_to_8[:, 8:] = 0.0
+        tp0 = EnsembleTransmissionParameters(ens_0_to_8, 1.0)
+
+        ptn_20_to_26 = np.zeros((32, 6))
+        ptn_20_to_26[20:26, :] = np.eye(6)
+        tp1 = PassthroughNodeTransmissionParameters(ptn_20_to_26)
+
+        # Check that `accepts_signal` responds correctly
+        assert pfss[0].accepts_signal(None, tp0)
+        assert not pfss[1].accepts_signal(None, tp0)
+        assert not pfss[2].accepts_signal(None, tp0)
+
+        assert not pfss[0].accepts_signal(None, tp1)
+        assert pfss[1].accepts_signal(None, tp1)
+        assert pfss[2].accepts_signal(None, tp1)
+
+    def test_transmits_signal(self):
+        # Create a series of transmission parameters
+        ptn_2_to_8 = np.zeros((32, 6))
+        ptn_2_to_8[2:8, :] = np.eye(6)
+        tp0 = PassthroughNodeTransmissionParameters(ptn_2_to_8.T)
+        tp0_slice = set(range(2, 8))
+
+        ptn_20_to_26 = np.zeros((32, 6))
+        ptn_20_to_26[20:26, :] = np.eye(6)
+        tp1 = PassthroughNodeTransmissionParameters(ptn_20_to_26.T)
+        tp1_slice = set(range(20, 26))
+
+        signal_parameter_slices = [(tp0, tp0_slice),
+                                   (tp1, tp1_slice),
+                                   ]
+
+        # Create a series of vertex slices
+        pfss = [
+            ParallelFilterSlice(slice(None), slice(0, 16), {},
+                                signal_parameter_slices),
+            ParallelFilterSlice(slice(None), slice(8, 24), {},
+                                signal_parameter_slices),
+            ParallelFilterSlice(slice(None), slice(16, 32), {},
+                                signal_parameter_slices),
+        ]
+
+        # Check that `transmits_signal` responds correctly
+        assert pfss[0].transmits_signal(None, tp0)
+        assert not pfss[1].transmits_signal(None, tp0)
+        assert not pfss[2].transmits_signal(None, tp0)
+
+        assert not pfss[0].transmits_signal(None, tp1)
+        assert pfss[1].transmits_signal(None, tp1)
+        assert pfss[2].transmits_signal(None, tp1)
 
 
 class TestSystemRegion(object):
     def test_sizeof(self):
-        # Create a system region, assert that the size is reported correctly.
-        sr = SystemRegion(size_in=5, size_out=10, machine_timestep=1000,
-                          transmission_delay=1, interpacket_pause=1)
+        # Create a system region
+        sr = SystemRegion(n_dims=512, machine_timestep=1000)
 
-        # Should always be 5 words
-        assert sr.sizeof(slice(None)) == 20
+        # Should always be 6 words
+        assert sr.sizeof() == 6 * 4
 
     @pytest.mark.parametrize(
-        "size_in, size_out, machine_timestep, transmission_delay, "
-        "interpacket_pause",
-        [(5, 16, 2000, 6, 1),
-         (10, 1, 1000, 1, 2)]
+        "n_dims, in_slice, out_slice, machine_timestep, vector_address",
+        [(256, slice(0, 10), slice(10, 12), 1000, 0x67800000),
+         (100, slice(5, 7), slice(0, 4), 2000, 0x67880000),
+         ]
     )
-    def test_write_subregion_to_file(self, size_in, size_out, machine_timestep,
-                                     transmission_delay, interpacket_pause):
+    def test_write_subregion_to_file(self, n_dims, in_slice, out_slice,
+                                     machine_timestep, vector_address):
         # Create the region
-        sr = SystemRegion(size_in=size_in, size_out=size_out,
-                          machine_timestep=machine_timestep,
-                          transmission_delay=transmission_delay,
-                          interpacket_pause=interpacket_pause)
+        sr = SystemRegion(n_dims=n_dims, machine_timestep=machine_timestep)
+
+        # Store the address of the shared vector in SDRAM
+        sr.shared_vector_address = vector_address
 
         # Write the region to file, assert the values are sane
         fp = tempfile.TemporaryFile()
-        sr.write_subregion_to_file(fp, slice(None))
+        sr.write_subregion_to_file(fp, in_slice=in_slice, out_slice=out_slice)
 
         fp.seek(0)
-        assert struct.unpack("<5I", fp.read()) == (
-            size_in, size_out, machine_timestep, transmission_delay,
-            interpacket_pause
+        assert struct.unpack("<6I", fp.read()) == (
+            machine_timestep,
+            n_dims,
+            in_slice.start,
+            in_slice.stop - in_slice.start,
+            out_slice.stop - out_slice.start,
+            vector_address,
         )
 
 
@@ -47,7 +117,6 @@ def test_get_transforms_and_keys():
     that appropriate keys are assigned.
     """
     # Create 2 mock signals and associated connections
-    sig_a = mock.Mock(name="signal A")
     sig_a_ks_0 = mock.Mock()
     sig_a_ks_1 = mock.Mock()
     sig_a_kss = {
@@ -55,50 +124,43 @@ def test_get_transforms_and_keys():
         1: sig_a_ks_1,
     }
 
-    sig_a.keyspace = mock.Mock()
-    sig_a.keyspace.side_effect = lambda index: sig_a_kss[index]
+    sig_a_ks = mock.Mock()
+    sig_a_ks.side_effect = lambda index: sig_a_kss[index]
+    sig_a = SignalParameters(keyspace=sig_a_ks)
 
-    conn_a = mock.Mock(name="connection A")
-    transform_a = np.eye(2)
+    conn_a = PassthroughNodeTransmissionParameters(np.eye(2))
 
-    sig_b = mock.Mock(name="signal B")
     sig_b_ks_0 = mock.Mock()
     sig_b_kss = {
         0: sig_b_ks_0,
     }
 
-    sig_b.keyspace = mock.Mock()
-    sig_b.keyspace.side_effect = lambda index: sig_b_kss[index]
+    sig_b_ks = mock.Mock()
+    sig_b_ks.side_effect = lambda index: sig_b_kss[index]
+    sig_b = SignalParameters(keyspace=sig_b_ks)
 
-    conn_b = mock.Mock(name="connection B")
-    transform_b = np.array([[0.5, 0.5]])
+    conn_b = PassthroughNodeTransmissionParameters(np.array([[0.5, 0.5]]))
+    transform_b = conn_b.transform
 
     # Create the dictionary type that will be used
-    signals_connections = {
-        sig_a: [conn_a],
-        sig_b: [conn_b],
-    }
+    pars = [(sig_a, conn_a), (sig_b, conn_b)]
 
     # Get the transforms and keys
-    with mock.patch("nengo_spinnaker.operators.filter.full_transform") as ft:
-        def full_transform(conn, allow_scalars):
-            assert not allow_scalars
-            if conn is conn_a:
-                return transform_a
-            elif conn is conn_b:
-                return transform_b
-            else:
-                assert False, "Unexpected connection."
-
-        ft.side_effect = full_transform
-
-        transforms, keys = get_transforms_and_keys(signals_connections)
+    transforms, keys, signal_parameter_slices = get_transforms_and_keys(pars)
 
     # Check that the transforms and keys are correct
     assert set(keys) == set([sig_a_ks_0, sig_a_ks_1, sig_b_ks_0])
     assert transforms.shape == (len(keys), 2)
     assert (np.all(transforms[0] == transform_b) or
             np.all(transforms[2] == transform_b))
+
+    # Check that the signal parameter slices are correct
+    for (par, sl) in signal_parameter_slices:
+        if par == conn_a:
+            assert sl == set(range(0, 2)) or sl == set(range(1, 3))
+        else:
+            assert par == conn_b
+            assert sl == set(range(0, 1)) or sl == set(range(2, 3))
 
 
 @pytest.mark.parametrize("latching", [False, True])
@@ -116,16 +178,15 @@ def test_get_transforms_and_keys_removes_zeroed_rows(latching):
     sig = mock.Mock()
     sig.keyspace = ks
     sig.latching = latching
+    sig = SignalParameters(keyspace=ks, latching=latching)
 
     # Create a mock connection
-    conn = mock.Mock()
+    conn = PassthroughNodeTransmissionParameters(transform)
 
-    signals_connections = {sig: [conn]}
+    signals_connections = [(sig, conn)]
 
     # Get the transform and keys
-    with mock.patch("nengo_spinnaker.operators.filter.full_transform") as ft:
-        ft.return_value = transform
-        t, keys = get_transforms_and_keys(signals_connections)
+    t, keys, _ = get_transforms_and_keys(signals_connections)
 
     if not latching:
         # Check the transform is correct
@@ -156,38 +217,11 @@ def test_get_transforms_and_keys_removes_zeroed_rows(latching):
                              mock.call(index=9)])
 
 
-@pytest.mark.xfail
-def test_get_transforms_and_keys_no_connection():
-    """Test that an identity matrix of the size of the signal is used when the
-    no connection is provided.
-    """
-    sig_a = mock.Mock()
-    sig_a.width = 5
-    sigs_conns = {sig_a: []}
-
-    # Get the signals and keys
-    transform, keys = get_transforms_and_keys(sigs_conns)
-    assert np.all(transform == np.eye(sig_a.width))
-
-
-def test_get_transforms_and_keys_multiple_connections_fails():
-    """Filters can't deal with multiple connections being represented by one
-    signal.
-    """
-    sig_a = mock.Mock()
-    sig_a.width = 5
-    sigs_conns = {sig_a: [mock.Mock() for _ in range(3)]}
-
-    # Get the signals and keys
-    with pytest.raises(NotImplementedError):
-        get_transforms_and_keys(sigs_conns)
-
-
-def test_get_transforms_and_keys_noting():
+def test_get_transforms_and_keys_nothing():
     """Check that no transform and no keys are returned for empty connection
     sets.
     """
-    tr, keys = get_transforms_and_keys(dict())
+    tr, keys, _ = get_transforms_and_keys([])
 
     assert keys == list()
     assert tr.ndim == 2
